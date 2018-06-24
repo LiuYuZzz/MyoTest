@@ -10,13 +10,16 @@ using namespace GRT;
 class DataCollector : public myo::DeviceListener {
 public:
 	DataCollector()
-		:onArm(false), isUnlocked(false), currentPose(), svm(SVM::LINEAR_KERNEL), fft(1024, 1, 8, true, false), filter(5, 8)
-		, maf(5, 8)//, lpf(0.1, 1, 8, 50, 1 / 1000)
+		:onArm(false), isUnlocked(false), currentPose(), svm(SVM::LINEAR_KERNEL)
+		, fft(2048, 1, 8, true, true)
+		, maf(10, 8), lpf(0.1, 1, 8, 195, 1.0 / 500.0)
 	{
 		//存储向量初始化
 		emgData = vector<vector<int>>(8, vector<int>(0, 0));
 		accelData = vector<vector<double>>(3, vector<double>(0, 0));
 		orientData = vector<vector<int>>(3, vector<int>(0, 0));
+		filteredData = vector<vector<double>>(8, vector<double>(0, 0));
+		featureData = vector<double>(0, 0);
 
 		//采样数据初始化
 		emgSamples.fill(0);
@@ -25,9 +28,12 @@ public:
 
 		//训练数据初始化
 		accuracy = 0;
-		trainingData.setNumDimensions(8);
+		trainingData.setNumDimensions(32);
 		trainingData.setDatasetName("DummyData");
 		trainingData.setInfoText("This data contains some dummy timeseries data");
+
+		//其他
+		svm.getScalingEnabled();
 	}
 
 	//当Myo没有配对时，被调用
@@ -102,60 +108,177 @@ public:
 	}
 
 	//接收数据存储到向量中
-	void recData() {
+	bool recData(size_t windowSize) {
 		for (size_t i = 0; i < 8; i++)
 			emgData[i].push_back(emgSamples[i]);
 		for (size_t i = 0; i < 3; i++) {
 			accelData[i].push_back(accelSamples[i]);
 			orientData[i].push_back(orientSamples[i]);
 		}
+		if (emgData[0].size() == windowSize) {
+			//cout << "Received data size : " << emgData[0].size() << endl;
+			return true;
+		}
+		return false;
 	}
 
-	//平滑滤波后的数据发送到文件
-	void filterDataToFile(string filename, UINT gestureLabel) {
-		ofstream outfile(filename, ios::app);
-		outfile << gestureLabel << endl;
-		for (size_t i = 0; i < accelData[0].size(); i++) {
-			VectorDouble temp;
-			for (size_t j = 0; j < 8; j++)
-				temp.push_back(emgData[j][i]);
-			for (size_t j = 0; j < 3; j++)
-				temp.push_back(accelData[j][i]);
-			for (size_t j = 0; j < 3; j++)
-				temp.push_back(orientData[j][i]);
-			VectorDouble filteredValue = maf.filter(temp);
-			for (size_t j = 0; j < filteredValue.size(); j++) {
-				outfile << filteredValue[j] << ",";
+	//数据预处理
+	void preProcessingData() {
+		for (size_t i = 0; i < emgData[0].size(); i++) {
+			VectorDouble inputVector;
+			for (size_t j = 0; j < emgSamples.size(); j++)
+				inputVector.push_back(emgData[j][i]);
+			VectorDouble filteredValue = lpf.filter(maf.filter(inputVector));
+			for (size_t m = 0; m < filteredValue.size(); m++)
+				filteredData[m].push_back(filteredValue[m]);
+		}
+	}
+
+	//特征提取数据(维数变化）
+	void featureExtractionData() {
+		//计算MAV
+		for (size_t j = 0; j < 8; j++) {
+			array<double, 4> temp = { 0,0,0,0 };
+			for (size_t i = 0; i < filteredData[0].size(); i++) {
+				temp[0] += fabs(filteredData[j][i]);
+				if (i < filteredData[0].size() - 1) {
+					double m = -(filteredData[j][i] * filteredData[j][i + 1]);
+					double n = fabs(filteredData[j][i] - filteredData[j][i + 1]);
+					if (m > 0 && n >= 0.02)
+						temp[1] += 1;
+				}
+
+				if (i < filteredData[0].size() - 2) {
+					double m = (filteredData[j][i + 1] - filteredData[j][i])*(filteredData[j][i + 1] - filteredData[j][i + 2]);
+					if (m >= 0.02)
+						temp[2] += 1;
+				}
+
+				if (i < filteredData[0].size() - 1) {
+					temp[3] += fabs(filteredData[j][i + 1] - filteredData[j][i]);
+				}
+
 			}
-			outfile << endl;
+			temp[0] = temp[0] / filteredData[0].size();
+			for(size_t i = 0; i < temp.size(); i++)
+				featureData.push_back(temp[i]);
 		}
-		outfile << endl;
+		//cout << "Size of featureData is : " << featureData.size() << endl;
+	}
+
+	//特征数据发送到文件（CSV文件，该文件可以直接被分类器使用）
+	void featureDataToFile(string trainingDataFile, UINT gestureLabel) {
+		ofstream outfile(trainingDataFile, ios::app);
+		cout << "Opened file : " << trainingDataFile << endl;
+		outfile << gestureLabel << ",";
+		for (size_t j = 0; j < featureData.size() - 1; j++)
+			outfile << featureData[j] << ",";
+		outfile << featureData[featureData.size() - 1] << endl;
+		cout << "Done Writing " << trainingDataFile << endl;
 		outfile.close();
 	}
 
-	//fft后数据发送文件
-	void fftDataToFile(string filename, UINT gestureLabel) {
-		ofstream outfile(filename, ios::app);
+	//将所有原始数据发送到文件中（CSV文件，该文件可以直接被分类器使用）
+	void allDataToFile(string alltrainingDataFile, UINT gestureLabel) {
+		ofstream outfile(alltrainingDataFile, ios::app);
+		cout << "Opened file" << endl;
 		for (size_t i = 0; i < accelData[0].size(); i++) {
-			VectorDouble temp;
-			for (size_t j = 0; j < 8; j++)
-				temp.push_back(emgData[j][i]);
-			for (size_t j = 0; j < 3; j++)
-				temp.push_back(accelData[j][i]);
-			for (size_t j = 0; j < 3; j++)
-				temp.push_back(orientData[j][i]);
-			fft.update(temp);
+			outfile << gestureLabel << ",";
+			for (size_t j = 0; j < 8; j++) {
+				outfile << emgData[j][i] << ",";
+			}
+			for (int j = 0; j < 3; j++) {
+				outfile << accelData[j][i] << ",";
+			}
+			for (int j = 0; j < 2; j++) {
+				outfile << orientData[j][i] << ",";
+			}
+			outfile << orientData[2][i] << endl;
 		}
-		vector<FastFourierTransform> fftResults = fft.getFFTResults();
-		outfile << gestureLabel << endl;
-		for (size_t i = 0; i < 14; i++) {
-			vector<double> magnitudeData = fftResults[i].getMagnitudeData();
-			for (UINT m = 0; m < magnitudeData.size(); m++)
-				outfile << magnitudeData[m] << ",";
-			outfile << endl;
-		}
-		outfile << endl;
+		cout << "Done writing " << alltrainingDataFile << endl;
+		cout << "Total size : " << accelData[0].size() << endl;
 		outfile.close();
+		cout << "Closing file" << endl;
+	}
+
+
+	//将EMG数据发送到文件中（CSV文件，该文件可以直接被分类器使用）
+	void emgDataToFile(string emgTrainingDataFile, UINT gestureLabel) {
+		ofstream outfile(emgTrainingDataFile, ios::app);
+		ofstream file("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\fftData.csv", ios::app);
+		cout << "Opened file" << endl;
+
+		//将滤波后的EMG数据发送到文件
+		for (size_t i = 0; i < emgData[0].size(); i++) {
+			outfile << gestureLabel << ",";
+			VectorDouble inputVector;
+			for (size_t j = 0; j < 8; j++) {
+				inputVector.push_back(emgData[j][i]);
+			}
+			VectorDouble filteredValue1 = maf.filter(inputVector);
+			VectorDouble filteredValue2 = lpf.filter(filteredValue1);
+			if (!fft.update(filteredValue2)) {
+				cout << "Fast Fourier Transform failed!" << endl;
+				cin.ignore();
+				exit(EXIT_FAILURE);
+			}
+			for (size_t m = 0; m < filteredValue2.size() - 1; m++)
+				outfile << filteredValue2[m] << ",";
+			outfile << filteredValue2[filteredValue2.size() - 1] << endl;
+		}
+
+		//将滤波后的EMG数据快速傅里叶变换后发送到文件
+		vector<FastFourierTransform> fftResults = fft.getFFTResults();
+		vector<vector<double>> temp = vector<vector<double>>(fftResults.size(), vector<double>(0, 0));
+		for (size_t m = 0; m < fftResults.size(); m++) {
+			VectorDouble magnitudeData = fftResults[m].getMagnitudeData();
+			for (size_t n = 0; n < magnitudeData.size(); n++)
+				temp[m].push_back(magnitudeData[n]);
+		}
+		for (size_t j = 0; j < temp[0].size(); j++) {
+			file << gestureLabel << ",";
+			for (size_t i = 0; i < fftResults.size() - 1; i++) {
+				file << temp[i][j] << ",";
+			}
+			file << temp[fftResults.size() - 1][j] << endl;
+		}
+
+
+		cout << "Done writing " << emgTrainingDataFile << endl;
+		cout << "Total size : " << emgData[0].size() << endl;
+		file.close();
+		outfile.close();
+		cout << "Closing file" << endl;
+	}
+
+	//将加速度数据发送到文件中（CSV文件，该文件可以直接被分类器使用）
+	void accelDataToFile(string accelTrainingDataFile, UINT gestureLabel) {
+		ofstream outfile(accelTrainingDataFile, ios::app);
+		cout << "Opened file" << endl;
+		for (size_t i = 0; i < accelData[0].size(); i++) {
+			outfile << gestureLabel << ",";
+			for (size_t j = 0; j < 2; j++) {
+				outfile << accelData[j][i] << ",";
+			}
+			outfile << accelData[2][i] << endl;
+		}
+		cout << "Done writing " << accelTrainingDataFile << endl;
+		cout << "Total size : " << accelData[0].size() << endl;
+		outfile.close();
+		cout << "Closing file" << endl;
+	}
+
+	//清空当前数据存储向量
+	void clearData() {
+		featureData.clear();
+		for (size_t i = 0; i < 8; i++) {
+			emgData[i].clear();
+			filteredData[i].clear();
+		}
+		for (size_t i = 0; i < 3; i++) {
+			accelData[i].clear();
+			orientData[i].clear();
+		}
 	}
 
 	//类标签设置
@@ -199,53 +322,17 @@ public:
 		}
 	}
 
-	//将原始数据发送到文件中（CSV文件，该文件可以直接被分类器使用）
-	int dataToFile(string filename, UINT gestureLabel) {
-		ofstream outfile(filename, ios::app);
-		cerr << "Opened file" << endl;
-		for (size_t i = 0; i < accelData[0].size(); i++) {
-			outfile << gestureLabel << ",";
-			for (int j = 0; j < 7; j++) {
-				outfile << emgData[j][i] << ",";
-			}
-			/*for (int j = 0; j < 3; j++) {
-				outfile << accelData[j][i] << ",";
-			}
-			for (int j = 0; j < 2; j++) {
-				outfile << orientData[j][i] << ",";
-			}
-			outfile << orientData[2][i] << endl;*/
-			outfile << emgData[7][i] << endl;
-		}
-		cerr << "Done writing" << endl;
-		outfile.close();
-		cerr << "Closing outfile" << endl;
-		return accelData[0].size();
-	}
-
-	//清空当前数据存储向量
-	void clearData() {
-		for (int i = 0; i < 8; i++)
-			emgData[i].clear();
-		for (int i = 0; i < 3; i++) {
-			accelData[i].clear();
-			orientData[i].clear();
-		}
-	}
-
-	//开始训练
+	//开始一般训练
 	void startTraining(string trainingDataFile, string trainingModelFile) {
 		if (!trainingData.loadDatasetFromCSVFile(trainingDataFile)) {
 			cout << "ERROR: Failed to load file to dataset!" << endl;
 			exit(EXIT_FAILURE);
 		}
 		cout << "getNumDimensions : " << trainingData.getNumDimensions() << endl;
-		testData = trainingData.split(80);
-		svm.getScalingEnabled();
+		testData = trainingData.split(90);
+
 
 		cout << "Ready to train data!" << endl;
-		//pipeline.setPreProcessingModule(maf);
-		//pipeline.setPreProcessingModule(lpf); 
 		pipeline.setClassifier(svm);
 		if (!pipeline.train(trainingData)) {
 			cout << "Filed to train classfier!" << endl;
@@ -267,32 +354,26 @@ public:
 			exit(EXIT_FAILURE);
 	}
 
+
 	void getClassLabel(string classLabelFile) {
 		ifstream fin(classLabelFile);
 		UINT i;
 		string tmp;
 		while (fin >> tmp) {
 			fin >> i;
-			gestureNames[i] = tmp;
-		}
-		svm.getScalingEnabled();
-		if (!pipeline.load("C:\\Users\\LiuYu\\Desktop\\Data\\Model\\SVMModel.txt")) {
-			cerr << "Filed to load the classfier model!" << endl;
-			exit(EXIT_FAILURE);
+			gestureNames[i] = tmp; 
 		}
 	}
 
 	//手势识别
-	void gestureRecognition() {
-		VectorDouble temp;
-		for (size_t i = 0; i < 8; i++)
-			temp.push_back(emgSamples[i]);
-		/*for (size_t i = 0; i < 3; i++)
-			temp.push_back(accelSamples[i]);
-		for (size_t i = 0; i < 3; i++)
-			temp.push_back(orientSamples[i]);*/
-		if (!pipeline.predict(temp)) {
-			cerr << "Filed to perform prediction!" << endl;
+	void gestureRecognition(string trainingModelFile) {
+		if (!pipeline.load(trainingModelFile)) {
+			cout << "Filed to load the classfier model!" << endl;
+			exit(EXIT_FAILURE);
+		}
+
+		if (!pipeline.predict(featureData)) {
+			cout << "Filed to perform prediction!" << endl;
 			cin.ignore();
 			exit(EXIT_FAILURE);
 		}
@@ -350,6 +431,8 @@ public:
 
 	//用于训练和手势识别
 	GestureRecognitionPipeline pipeline;
+	vector<vector<double>> filteredData;
+	VectorDouble featureData;
 	double accuracy;
 	SVM svm;
 	ClassificationData trainingData;
@@ -358,7 +441,6 @@ public:
 
 	//其他
 	FFT fft;
-	MovingAverageFilter filter;
 	LowPassFilter lpf;
 	MovingAverageFilter maf;
 };
@@ -369,8 +451,8 @@ int main(int argc, const char* argv[]) {
 		cout << "1.CollectData" << endl << "2.TrainModel" << endl << "3.GestureRecognition" << endl;
 		char ans;
 		string gesturename;
+		size_t n;
 		UINT gestureLabel;
-		int size;
 		DataCollector collector;
 
 		while ((ans = _getch()) != '1' && ans != '2' && ans != '3');
@@ -388,40 +470,41 @@ int main(int argc, const char* argv[]) {
 				myo->setStreamEmg(myo::Myo::streamEmgEnabled);
 				hub.addListener(&collector);
 				system("md C:\\Users\\LiuYu\\Desktop\\Data\\RawData");
-				cout << "Enter name of gesture: ";
+				cout << "Enter the name of gesture : ";
 				cin >> gesturename;
 				if (gesturename.size() == 0) return 0;
+				cout << "Enter the number of recording : ";
+				cin >> n;
 				cout << "Press h when ready to start recording." << endl;
 				while ('h' != _getch()) {
 				}
 				cout << "Recording gesture. Press Esc to end recording." << endl;
-				while (1) {
+				while (n--) {
 					hub.run(2);
 					if (!collector.onArm) {
-						cout << "!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!" << endl;
-						return 1;
+						throw runtime_error("!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!");
 					}
-					collector.print();
-					collector.recData();
+					while (!collector.recData(200)) {
+						hub.run(2);
+						collector.print();
+					}
 					if (GetAsyncKeyState(VK_ESCAPE))
 						break;
-				}
-				cout << "Use recording? (y/n)" << endl;
-				char ch;
-				while ((ch = _getch()) != 'n' && ch != 'y');
-				if (ch == 'y') {
-					gestureLabel = collector.classLabelFile(gesturename);
-					size = collector.dataToFile("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\trainingData.csv", gestureLabel);
-					//collector.fftDataToFile("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\fftData.csv", gestureLabel);
-					//collector.filterDataToFile("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\filterData.csv", gestureLabel);
-					cout << "The size of data is " << size << endl;
-					cout << "Written trainingData.csv ok!" << endl;
+					cout << "Use recording? (y/n)" << endl;
+					char ch;
+					while ((ch = _getch()) != 'n' && ch != 'y');
+					if (ch == 'y') {
+						collector.preProcessingData();
+						collector.featureExtractionData();
+						gestureLabel = collector.classLabelFile(gesturename);
+						collector.featureDataToFile("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\trainingData.csv", gestureLabel);
+					}
+					collector.clearData();
 				}
 				collector.clearData();
 			}
 			catch (const std::exception& e) {
-				cerr << "Error: " << e.what() << std::endl;
-				cerr << "Press enter to continue.";
+				cerr << "Error: " << e.what() << endl;
 				break;
 			}
 			break;
@@ -442,19 +525,24 @@ int main(int argc, const char* argv[]) {
 				hub.addListener(&collector);
 				collector.getClassLabel("C:\\Users\\LiuYu\\Desktop\\Data\\ClassLabelFile.txt");
 				while (1) {
-					hub.run(50);
+					hub.run(2);
 					if (!collector.onArm) {
-						cout << "!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!!!!!" << endl;
-						return 1;
+						throw runtime_error("!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!");
 					}
-					collector.gestureRecognition();
+					while (!collector.recData(200)) {
+						hub.run(2);
+					}
+					collector.preProcessingData();
+					collector.featureExtractionData();
+					collector.gestureRecognition("C:\\Users\\LiuYu\\Desktop\\Data\\Model\\SVMModel.txt");
+					collector.clearData();
 					if (GetAsyncKeyState(VK_ESCAPE))
 						break;
 				}
+				collector.clearData();
 			}
 			catch (const std::exception& e) {
-				cerr << "Error: " << e.what() << std::endl;
-				cerr << "Press enter to continue.";
+				cerr << "Error: " << e.what() << endl;
 				break;
 			}
 			break;
@@ -462,4 +550,5 @@ int main(int argc, const char* argv[]) {
 			break;
 		}
 	}
+	return 0;
 }
