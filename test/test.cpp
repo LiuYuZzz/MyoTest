@@ -2,41 +2,56 @@
 #include <conio.h>
 #include <myo/myo.hpp>
 #include <GRT/GRT.h>
+#include <sapi.h>
+#include <string>
 
 using namespace std;
 using namespace GRT;
 
-//Êı¾İ²É¼¯
+std::wstring s2ws(const std::string& s)
+{
+	int len;
+	int slength = (int)s.length() + 1;
+	len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, 0, 0);
+	wchar_t* buf = new wchar_t[len];
+	MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, buf, len);
+	std::wstring r(buf);
+	delete[] buf;
+	return r;
+}
+
+//æ•°æ®é‡‡é›†
 class DataCollector : public myo::DeviceListener {
 public:
 	DataCollector()
-		:onArm(false), isUnlocked(false), currentPose(), svm(SVM::LINEAR_KERNEL)
-		, fft(2048, 1, 8, true, true)
-		, maf(10, 8), lpf(0.1, 1, 8, 195, 1.0 / 500.0)
+		:onArm(false), isUnlocked(false), currentPose(), threshold(0), accuracy(0)
+		, fft(2048, 1, 8, true, true), svm(SVM::LINEAR_KERNEL)
+		, maf(15, 8), lpf(0.1, 1, 8, 200, 1.0 / 500.0)
 	{
-		//´æ´¢ÏòÁ¿³õÊ¼»¯
+		//å­˜å‚¨å‘é‡åˆå§‹åŒ–
 		emgData = vector<vector<int>>(8, vector<int>(0, 0));
 		accelData = vector<vector<double>>(3, vector<double>(0, 0));
 		orientData = vector<vector<int>>(3, vector<int>(0, 0));
 		filteredData = vector<vector<double>>(8, vector<double>(0, 0));
 		featureData = vector<double>(0, 0);
 
-		//²ÉÑùÊı¾İ³õÊ¼»¯
+		//é‡‡æ ·æ•°æ®åˆå§‹åŒ–
 		emgSamples.fill(0);
 		accelSamples.fill(0);
 		orientSamples.fill(0);
 
-		//ÑµÁ·Êı¾İ³õÊ¼»¯
+		//è®­ç»ƒæ•°æ®åˆå§‹åŒ–
 		accuracy = 0;
 		trainingData.setNumDimensions(32);
 		trainingData.setDatasetName("DummyData");
 		trainingData.setInfoText("This data contains some dummy timeseries data");
 
-		//ÆäËû
+		//å…¶ä»–
 		svm.getScalingEnabled();
+		//svm.enableNullRejection(true);
 	}
 
-	//µ±MyoÃ»ÓĞÅä¶ÔÊ±£¬±»µ÷ÓÃ
+	//å½“Myoæ²¡æœ‰é…å¯¹æ—¶ï¼Œè¢«è°ƒç”¨
 	void onUnpair(myo::Myo* myo, uint64_t timestamp) {
 		emgSamples.fill(0);
 		accelSamples.fill(0);
@@ -45,21 +60,21 @@ public:
 		isUnlocked = false;
 	}
 
-	//µ±MyoÌá¹©ĞÂµÄEMGÊı¾İÊ±£¬±»µ÷ÓÃ
+	//å½“Myoæä¾›æ–°çš„EMGæ•°æ®æ—¶ï¼Œè¢«è°ƒç”¨
 	void onEmgData(myo::Myo* myo, uint64_t timestamp, const int8_t* emg) {
 		for (int i = 0; i < 8; i++)
 			emgSamples[i] = static_cast<int>(emg[i]);
 
 	}
 
-	//µ±MyoÌá¹©ĞÂµÄ¼ÓËÙ¶È¼ÆÊı¾İÊ±£¬µ¥Î»G£¬±»µ÷ÓÃ
+	//å½“Myoæä¾›æ–°çš„åŠ é€Ÿåº¦è®¡æ•°æ®æ—¶ï¼Œå•ä½Gï¼Œè¢«è°ƒç”¨
 	void onAccelerometerData(myo::Myo* myo, uint64_t timestamp, const myo::Vector3<float>& accel) {
 		for (size_t i = 0; i < 3; i++)
 			accelSamples[i] = accel[i];
 
 	}
 
-	//µ±MyoÌá¹©ĞÂµÄ¶¨Î»Êı¾İÊ±£¬ÒÔËÄÔªÊı±íÊ¾£¬±»µ÷ÓÃ
+	//å½“Myoæä¾›æ–°çš„å®šä½æ•°æ®æ—¶ï¼Œä»¥å››å…ƒæ•°è¡¨ç¤ºï¼Œè¢«è°ƒç”¨
 	void onOrientationData(myo::Myo* myo, uint64_t timestamp,
 		const myo::Quaternion<float>& rotation) {
 		double roll = atan2(2.0f * (rotation.w() * rotation.x() + rotation.y() * rotation.z()),
@@ -72,7 +87,7 @@ public:
 		orientSamples[2] = static_cast<int>((yaw + (float)M_PI) / (M_PI * 2.0f) * 18);
 	}
 
-	//µ±Myo¼ì²âµ½ÓÃ»§¶¯×÷¸Ä±äÊ±£¬±»µ÷ÓÃ
+	//å½“Myoæ£€æµ‹åˆ°ç”¨æˆ·åŠ¨ä½œæ”¹å˜æ—¶ï¼Œè¢«è°ƒç”¨
 	void onPose(myo::Myo* myo, uint64_t timestamp, myo::Pose pose) {
 		currentPose = pose;
 		if (pose != myo::Pose::unknown && pose != myo::Pose::rest) {
@@ -84,7 +99,7 @@ public:
 		}
 	}
 
-	//µ±Myo¼ì²âµ½ÔÚÊÖ±ÛÉÏÊ±£¬±»µ÷ÓÃ
+	//å½“Myoæ£€æµ‹åˆ°åœ¨æ‰‹è‡‚ä¸Šæ—¶ï¼Œè¢«è°ƒç”¨
 	void onArmSync(myo::Myo* myo, uint64_t timestamp, myo::Arm arm,
 		myo::XDirection xDirection, float rotation,
 		myo::WarmupState warmupState) {
@@ -92,22 +107,22 @@ public:
 		whichArm = arm;
 	}
 
-	//µ±Myo´ÓÊÖ±ÛÉÏÒÆ¿ª»òÔòÒÆ¶¯Ê±£¬±»µ÷ÓÃ
+	//å½“Myoä»æ‰‹è‡‚ä¸Šç§»å¼€æˆ–åˆ™ç§»åŠ¨æ—¶ï¼Œè¢«è°ƒç”¨
 	void onArmUnsync(myo::Myo* myo, uint64_t timestamp) {
 		onArm = false;
 	}
 
-	//µ±Myo½âËøÊ±£¬±»µ÷ÓÃ
+	//å½“Myoè§£é”æ—¶ï¼Œè¢«è°ƒç”¨
 	void onUnlock(myo::Myo* myo, uint64_t timestamp) {
 		isUnlocked = true;
 	}
 
-	//µ±MyoËø¶¨Ê±£¬±»µ÷ÓÃ
+	//å½“Myoé”å®šæ—¶ï¼Œè¢«è°ƒç”¨
 	void onLock(myo::Myo* myo, uint64_t timestamp) {
 		isUnlocked = false;
 	}
 
-	//½ÓÊÕÊı¾İ´æ´¢µ½ÏòÁ¿ÖĞ
+	//æ¥æ”¶æ•°æ®å­˜å‚¨åˆ°å‘é‡ä¸­
 	bool recData(size_t windowSize) {
 		for (size_t i = 0; i < 8; i++)
 			emgData[i].push_back(emgSamples[i]);
@@ -116,13 +131,44 @@ public:
 			orientData[i].push_back(orientSamples[i]);
 		}
 		if (emgData[0].size() == windowSize) {
-			//cout << "Received data size : " << emgData[0].size() << endl;
 			return true;
 		}
 		return false;
 	}
 
-	//Êı¾İÔ¤´¦Àí
+	//è®¾ç½®èµ·ç‚¹æ‰‹åŠ¿é˜ˆå€¼
+	bool setThreshold(size_t windowSize) {
+		for (size_t i = 0; i < 8; i++)
+			emgData[i].push_back(emgSamples[i]);
+		for (size_t i = 0; i < 3; i++) {
+			accelData[i].push_back(accelSamples[i]);
+			orientData[i].push_back(orientSamples[i]);
+		}
+		if (emgData[0].size() == windowSize) {
+			for (size_t i = 0; i < emgData[0].size(); i++) {
+				VectorDouble inputVector;
+				for (size_t j = 0; j < emgSamples.size(); j++)
+					inputVector.push_back(emgData[j][i]);
+				VectorDouble filteredValue = lpf.filter(maf.filter(inputVector));
+				for (size_t m = 0; m < filteredValue.size(); m++)
+					filteredData[m].push_back(filteredValue[m]);
+			}
+			for (size_t j = 0; j < 8; j++) {
+				double temp = 0;
+				for (size_t i = 0; i < filteredData[0].size(); i++) 
+					temp += fabs(filteredData[j][i]);
+				temp = temp / filteredData[0].size();
+				featureData.push_back(temp);
+			}
+			for (size_t i = 0; i < 8; i++)
+				threshold += featureData[i];
+			cout << "Set threshold ok!" << endl;
+			return true;
+		}
+		return false;
+	}
+
+	//æ•°æ®é¢„å¤„ç†
 	void preProcessingData() {
 		for (size_t i = 0; i < emgData[0].size(); i++) {
 			VectorDouble inputVector;
@@ -134,9 +180,9 @@ public:
 		}
 	}
 
-	//ÌØÕ÷ÌáÈ¡Êı¾İ(Î¬Êı±ä»¯£©
+	//ç‰¹å¾æå–æ•°æ®(ç»´æ•°å˜åŒ–ï¼‰
 	void featureExtractionData() {
-		//¼ÆËãMAV
+		//è®¡ç®—MAV
 		for (size_t j = 0; j < 8; j++) {
 			array<double, 4> temp = { 0,0,0,0 };
 			for (size_t i = 0; i < filteredData[0].size(); i++) {
@@ -163,10 +209,22 @@ public:
 			for(size_t i = 0; i < temp.size(); i++)
 				featureData.push_back(temp[i]);
 		}
-		//cout << "Size of featureData is : " << featureData.size() << endl;
 	}
 
-	//ÌØÕ÷Êı¾İ·¢ËÍµ½ÎÄ¼ş£¨CSVÎÄ¼ş£¬¸ÃÎÄ¼ş¿ÉÒÔÖ±½Ó±»·ÖÀàÆ÷Ê¹ÓÃ£©
+	//å°†å„åŠ¨ä½œçš„å„ä¸ªé€šé“çš„MAVä¹‹å’Œå‘é€åˆ°æ–‡ä»¶
+	void sumMAVToFile(string mavDataFile,size_t num) {
+		ofstream outfile(mavDataFile, ios::app);
+		cout << "Opened file : " << mavDataFile << endl;
+		double temp = 0;
+		for (size_t i = 0; i < 8; i++) 
+			temp += featureData[i * 4];
+		if (num == 0)
+			outfile << temp << endl;
+		else
+			outfile << temp << ",";
+	}
+
+	//ç‰¹å¾æ•°æ®å‘é€åˆ°æ–‡ä»¶ï¼ˆCSVæ–‡ä»¶ï¼Œè¯¥æ–‡ä»¶å¯ä»¥ç›´æ¥è¢«åˆ†ç±»å™¨ä½¿ç”¨ï¼‰
 	void featureDataToFile(string trainingDataFile, UINT gestureLabel) {
 		ofstream outfile(trainingDataFile, ios::app);
 		cout << "Opened file : " << trainingDataFile << endl;
@@ -178,7 +236,7 @@ public:
 		outfile.close();
 	}
 
-	//½«ËùÓĞÔ­Ê¼Êı¾İ·¢ËÍµ½ÎÄ¼şÖĞ£¨CSVÎÄ¼ş£¬¸ÃÎÄ¼ş¿ÉÒÔÖ±½Ó±»·ÖÀàÆ÷Ê¹ÓÃ£©
+	//å°†æ‰€æœ‰åŸå§‹æ•°æ®å‘é€åˆ°æ–‡ä»¶ä¸­ï¼ˆCSVæ–‡ä»¶ï¼Œè¯¥æ–‡ä»¶å¯ä»¥ç›´æ¥è¢«åˆ†ç±»å™¨ä½¿ç”¨ï¼‰
 	void allDataToFile(string alltrainingDataFile, UINT gestureLabel) {
 		ofstream outfile(alltrainingDataFile, ios::app);
 		cout << "Opened file" << endl;
@@ -201,14 +259,13 @@ public:
 		cout << "Closing file" << endl;
 	}
 
-
-	//½«EMGÊı¾İ·¢ËÍµ½ÎÄ¼şÖĞ£¨CSVÎÄ¼ş£¬¸ÃÎÄ¼ş¿ÉÒÔÖ±½Ó±»·ÖÀàÆ÷Ê¹ÓÃ£©
+	//å°†EMGæ•°æ®å‘é€åˆ°æ–‡ä»¶ä¸­ï¼ˆCSVæ–‡ä»¶ï¼Œè¯¥æ–‡ä»¶å¯ä»¥ç›´æ¥è¢«åˆ†ç±»å™¨ä½¿ç”¨ï¼‰
 	void emgDataToFile(string emgTrainingDataFile, UINT gestureLabel) {
 		ofstream outfile(emgTrainingDataFile, ios::app);
 		ofstream file("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\fftData.csv", ios::app);
 		cout << "Opened file" << endl;
 
-		//½«ÂË²¨ºóµÄEMGÊı¾İ·¢ËÍµ½ÎÄ¼ş
+		//å°†æ»¤æ³¢åçš„EMGæ•°æ®å‘é€åˆ°æ–‡ä»¶
 		for (size_t i = 0; i < emgData[0].size(); i++) {
 			outfile << gestureLabel << ",";
 			VectorDouble inputVector;
@@ -227,7 +284,7 @@ public:
 			outfile << filteredValue2[filteredValue2.size() - 1] << endl;
 		}
 
-		//½«ÂË²¨ºóµÄEMGÊı¾İ¿ìËÙ¸µÀïÒ¶±ä»»ºó·¢ËÍµ½ÎÄ¼ş
+		//å°†æ»¤æ³¢åçš„EMGæ•°æ®å¿«é€Ÿå‚…é‡Œå¶å˜æ¢åå‘é€åˆ°æ–‡ä»¶
 		vector<FastFourierTransform> fftResults = fft.getFFTResults();
 		vector<vector<double>> temp = vector<vector<double>>(fftResults.size(), vector<double>(0, 0));
 		for (size_t m = 0; m < fftResults.size(); m++) {
@@ -251,7 +308,7 @@ public:
 		cout << "Closing file" << endl;
 	}
 
-	//½«¼ÓËÙ¶ÈÊı¾İ·¢ËÍµ½ÎÄ¼şÖĞ£¨CSVÎÄ¼ş£¬¸ÃÎÄ¼ş¿ÉÒÔÖ±½Ó±»·ÖÀàÆ÷Ê¹ÓÃ£©
+	//å°†åŠ é€Ÿåº¦æ•°æ®å‘é€åˆ°æ–‡ä»¶ä¸­ï¼ˆCSVæ–‡ä»¶ï¼Œè¯¥æ–‡ä»¶å¯ä»¥ç›´æ¥è¢«åˆ†ç±»å™¨ä½¿ç”¨ï¼‰
 	void accelDataToFile(string accelTrainingDataFile, UINT gestureLabel) {
 		ofstream outfile(accelTrainingDataFile, ios::app);
 		cout << "Opened file" << endl;
@@ -268,7 +325,7 @@ public:
 		cout << "Closing file" << endl;
 	}
 
-	//Çå¿Õµ±Ç°Êı¾İ´æ´¢ÏòÁ¿
+	//æ¸…ç©ºå½“å‰æ•°æ®å­˜å‚¨å‘é‡
 	void clearData() {
 		featureData.clear();
 		for (size_t i = 0; i < 8; i++) {
@@ -279,16 +336,17 @@ public:
 			accelData[i].clear();
 			orientData[i].clear();
 		}
+		predictClassLabel = 0;
 	}
 
-	//Àà±êÇ©ÉèÖÃ
+	//ç±»æ ‡ç­¾è®¾ç½®
 	UINT classLabelFile(string gestureName) {
 		UINT gestureLabel = 1;
 		UINT num;
 		string tmp;
 		map<string, UINT> gesture;
 
-		//²éÕÒClassIDFile.txtÏÂ£¬ÊÇ·ñº¬ÓĞgesturename
+		//æŸ¥æ‰¾ClassIDFile.txtä¸‹ï¼Œæ˜¯å¦å«æœ‰gesturename
 		fstream f("C:\\Users\\LiuYu\\Desktop\\Data\\ClassLabelFile.txt", ios::in);
 		while (f.peek() != EOF) {
 			f >> tmp;
@@ -297,7 +355,7 @@ public:
 		}
 		f.close();
 
-		//¸øÃ¿¸öÊÖÊÆ±àºÅ£¨´Ó1¿ªÊ¼£©
+		//ç»™æ¯ä¸ªæ‰‹åŠ¿ç¼–å·ï¼ˆä»1å¼€å§‹ï¼‰
 		if (gesture.size() == 0) {
 			gestureLabel = 1;
 			gesture[gestureName] = gestureLabel;
@@ -322,7 +380,7 @@ public:
 		}
 	}
 
-	//¿ªÊ¼Ò»°ãÑµÁ·
+	//å¼€å§‹æ‰‹å½¢æ‰‹åŠ¿è®­ç»ƒ
 	void startTraining(string trainingDataFile, string trainingModelFile) {
 		if (!trainingData.loadDatasetFromCSVFile(trainingDataFile)) {
 			cout << "ERROR: Failed to load file to dataset!" << endl;
@@ -354,7 +412,7 @@ public:
 			exit(EXIT_FAILURE);
 	}
 
-
+	//è·å–æ‰‹åŠ¿ç±»æ ‡ç­¾
 	void getClassLabel(string classLabelFile) {
 		ifstream fin(classLabelFile);
 		UINT i;
@@ -365,30 +423,51 @@ public:
 		}
 	}
 
-	//ÊÖÊÆÊ¶±ğ
+	//æ‰‹åŠ¿è¯†åˆ«
 	void gestureRecognition(string trainingModelFile) {
 		if (!pipeline.load(trainingModelFile)) {
 			cout << "Filed to load the classfier model!" << endl;
 			exit(EXIT_FAILURE);
 		}
-
-		if (!pipeline.predict(featureData)) {
-			cout << "Filed to perform prediction!" << endl;
-			cin.ignore();
-			exit(EXIT_FAILURE);
-		}
-		if (GetAsyncKeyState(VK_SPACE)) {
-			UINT predictClassLabel = pipeline.getPredictedClassLabel();
-			double maximumLikelihood = pipeline.getMaximumLikelihood();
-			if (predictClassLabel)
-				cout << maximumLikelihood << " " << gestureNames[predictClassLabel] << endl;
+		double temp = 0;
+		for (size_t i = 0; i < 8; i++)
+			temp += featureData[i * 4];
+		if (temp >= threshold) {
+			if (!pipeline.predict(featureData)) {
+				cout << "Filed to perform prediction!" << endl;
+				cin.ignore();
+				exit(EXIT_FAILURE);
+			}
+			//if (GetAsyncKeyState(VK_SPACE)) {
+				predictClassLabel = pipeline.getPredictedClassLabel();
+				double maximumLikelihood = pipeline.getMaximumLikelihood();
+				if (predictClassLabel)
+					cout << maximumLikelihood << " " << gestureNames[predictClassLabel] << endl;
+			//}
 		}
 	}
 
-	//´òÓ¡EMGÊı¾İºÍpitch,roll,yaw
+	//æ–‡æœ¬è½¬è¯­éŸ³
+	void textSpeak() {
+		ISpVoice * pVoice = NULL;
+		if (FAILED(::CoInitialize(NULL)))
+			exit(EXIT_FAILURE);
+		HRESULT hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void **)&pVoice);
+		if (SUCCEEDED(hr))
+		{
+			wstring temp = s2ws(gestureNames[predictClassLabel]);
+			LPCWSTR result = temp.c_str();
+			hr = pVoice->Speak(result, 0, NULL);
+			pVoice->Release();
+			pVoice = NULL;
+		}
+		::CoUninitialize();
+	}
+
+	//æ‰“å°EMGæ•°æ®å’Œpitch,roll,yaw
 	void print() {
 		cout << '\r';
-		//EMGÊı¾İ
+		//EMGæ•°æ®
 		for (size_t i = 0; i < emgSamples.size(); i++) {
 			ostringstream oss;
 			oss << static_cast<int>(emgSamples[i]);
@@ -413,33 +492,35 @@ public:
 	}
 
 
-	//´æ´¢Êı¾İ
+	//å­˜å‚¨æ•°æ®
 	vector<vector<int>> emgData;
 	vector<vector<double>> accelData;
 	vector<vector<int>> orientData;
 
-	//MYO×´Ì¬
+	//MYOçŠ¶æ€
 	bool onArm;
 	bool isUnlocked;
 	myo::Arm whichArm;
 	myo::Pose currentPose;
 
-	//²ÉÑùÊı¾İ
+	//é‡‡æ ·æ•°æ®
 	array<int, 8> emgSamples;
 	array<double, 3> accelSamples;
 	array<int, 3> orientSamples;
 
-	//ÓÃÓÚÑµÁ·ºÍÊÖÊÆÊ¶±ğ
+	//ç”¨äºè®­ç»ƒå’Œæ‰‹åŠ¿è¯†åˆ«
+	VectorDouble featureData;
+	double threshold;
+	double accuracy;
+	UINT predictClassLabel;
+	SVM svm;
 	GestureRecognitionPipeline pipeline;
 	vector<vector<double>> filteredData;
-	VectorDouble featureData;
-	double accuracy;
-	SVM svm;
 	ClassificationData trainingData;
 	ClassificationData testData;
 	map<UINT, string> gestureNames;
 
-	//ÆäËû
+	//å·¥å…·
 	FFT fft;
 	LowPassFilter lpf;
 	MovingAverageFilter maf;
@@ -481,9 +562,8 @@ int main(int argc, const char* argv[]) {
 				cout << "Recording gesture. Press Esc to end recording." << endl;
 				while (n--) {
 					hub.run(2);
-					if (!collector.onArm) {
+					if (!collector.onArm) 
 						throw runtime_error("!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!");
-					}
 					while (!collector.recData(200)) {
 						hub.run(2);
 						collector.print();
@@ -498,6 +578,7 @@ int main(int argc, const char* argv[]) {
 						collector.featureExtractionData();
 						gestureLabel = collector.classLabelFile(gesturename);
 						collector.featureDataToFile("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\trainingData.csv", gestureLabel);
+						collector.sumMAVToFile("C:\\Users\\LiuYu\\Desktop\\Data\\RawData\\sumMAVData.csv",n);
 					}
 					collector.clearData();
 				}
@@ -523,18 +604,24 @@ int main(int argc, const char* argv[]) {
 				cout << "Connected to a Myo armband!" << endl << endl;
 				myo->setStreamEmg(myo::Myo::streamEmgEnabled);
 				hub.addListener(&collector);
+				cout << "Please relax your hand to set the threshold!" << endl;
+				while (!collector.setThreshold(2000)) {
+					hub.run(2);
+					if (!collector.onArm)
+						throw runtime_error("!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!");
+				}
+				collector.clearData();
 				collector.getClassLabel("C:\\Users\\LiuYu\\Desktop\\Data\\ClassLabelFile.txt");
 				while (1) {
 					hub.run(2);
-					if (!collector.onArm) {
+					if (!collector.onArm)
 						throw runtime_error("!!!!!!!!!!!!!!Please sync the Myo!!!!!!!!!!!!!!!!!");
-					}
-					while (!collector.recData(200)) {
+					while (!collector.recData(100)) 
 						hub.run(2);
-					}
 					collector.preProcessingData();
 					collector.featureExtractionData();
 					collector.gestureRecognition("C:\\Users\\LiuYu\\Desktop\\Data\\Model\\SVMModel.txt");
+					collector.textSpeak();
 					collector.clearData();
 					if (GetAsyncKeyState(VK_ESCAPE))
 						break;
